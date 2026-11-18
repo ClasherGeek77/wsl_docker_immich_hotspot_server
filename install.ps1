@@ -1,0 +1,136 @@
+<#
+  install.ps1  -  one-click installer for the WSL+Docker+Immich+zrok+hotspot home server.
+
+  Run from an ELEVATED PowerShell, from the root of this repo:
+
+      powershell -ExecutionPolicy Bypass -File .\install.ps1
+
+  What it does (interactive + safe; idempotent  -  re-run any time):
+    1. Checks prerequisites (admin, WSL distro, Docker in WSL).
+    2. Stages the Windows scripts to C:\home-server\ (runtime\ + setup\ + lib\).
+    3. Ensures immich\.env exists (prompts for the secret values if missing).
+    4. Registers the scheduled tasks (keepalive anchor + health watchdog).
+    5. Brings up the Immich/zrok Docker stack.
+    6. Starts the hotspot and applies TCP tuning.
+    7. Prints a health summary.
+
+  Nothing here is destructive: existing .env is never overwritten, tasks are
+  re-registered idempotently, and `docker compose up -d` is a no-op if already up.
+#>
+
+[CmdletBinding()]
+param(
+  [string]$InstallRoot = 'C:\home-server',
+  [string]$Distro      = 'Ubuntu-22.04',
+  [switch]$SkipDocker,
+  [switch]$SkipHotspot
+)
+
+$ErrorActionPreference = 'Stop'
+$repo = (Get-Item .).FullName
+
+function Step($n, $msg) { Write-Host "`n[$n] $msg" -ForegroundColor Cyan }
+function Ok($msg)       { Write-Host "    OK  $msg" -ForegroundColor Green }
+function Warn($msg)     { Write-Host "    !!  $msg" -ForegroundColor Yellow }
+
+# --- 1. Prerequisites -------------------------------------------------------
+Step 1 'Checking prerequisites'
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+           ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+if (-not $isAdmin) { throw 'Must run as Administrator (needed for scheduled tasks + netsh).' }
+Ok 'Running elevated.'
+
+$wslRaw = wsl.exe -l -q 2>$null; $distros = ($wslRaw -join "") -replace "\x00", ""; if ($distros -notmatch $Distro) {
+  throw "WSL distro '$Distro' not found. Install it first: wsl --install -d $Distro"
+}
+Ok "WSL distro '$Distro' present."
+
+$dockerActive = (wsl.exe -d $Distro -u root -- bash -c 'systemctl is-active docker 2>/dev/null || echo down' 2>&1 |
+                 Out-String).Trim()
+if ($dockerActive -notmatch 'active') { Warn "Docker not active yet in WSL (=$dockerActive)  -  the keepalive task will start it." }
+else { Ok 'Docker active in WSL.' }
+
+# --- 2. Stage scripts to InstallRoot ---------------------------------------
+Step 2 "Staging Windows scripts to $InstallRoot"
+# 'state' holds the watchdog's escalation state, machine-readable health status,
+# incident log and hotspot cooldown. Without it the watchdog cannot persist state
+# between runs and would re-escalate from scratch every cycle.
+foreach ($sub in 'runtime','setup','lib','logs','state') {
+  New-Item -ItemType Directory -Path (Join-Path $InstallRoot $sub) -Force | Out-Null
+}
+Copy-Item (Join-Path $repo 'windows\runtime\*') (Join-Path $InstallRoot 'runtime') -Force
+Copy-Item (Join-Path $repo 'windows\setup\*')   (Join-Path $InstallRoot 'setup')   -Force
+Copy-Item (Join-Path $repo 'windows\lib\*')     (Join-Path $InstallRoot 'lib')     -Force
+Ok "Staged runtime\, setup\, lib\ (dot-source relationship preserved)."
+
+# --- 3. Ensure immich\.env --------------------------------------------------
+Step 3 'Ensuring immich\.env'
+$envPath     = Join-Path $repo 'immich\.env'
+$envExample  = Join-Path $repo 'immich\.env.example'
+if (Test-Path $envPath) {
+  Ok '.env already exists  -  leaving it untouched.'
+} else {
+  Warn '.env not found  -  creating from .env.example and prompting for secrets.'
+  $content = Get-Content $envExample -Raw
+  foreach ($key in 'DB_PASSWORD','ZROK_ENABLE_TOKEN','ZROK_SHARE_NAME','HOTSPOT_SSID','HOTSPOT_PASSPHRASE') {
+    $val = Read-Host "    Enter $key"
+    $content = $content -replace "(?m)^$key=.*$", "$key=$val"
+  }
+  Set-Content -Path $envPath -Value $content -Encoding UTF8
+  Ok '.env written (gitignored  -  never committed).'
+}
+
+# --- 3.5 WSL memory cap + network hardening --------------------------------
+Step 3.5 'Applying .wslconfig and WSL network hardening'
+$wslCfgSrc = Join-Path $repo 'windows\wslconfig-template'
+$wslCfgDst = Join-Path $env:USERPROFILE '.wslconfig'
+if (Test-Path $wslCfgDst) {
+  Ok '.wslconfig already present - leaving it untouched.'
+} elseif (Test-Path $wslCfgSrc) {
+  Copy-Item $wslCfgSrc $wslCfgDst -Force
+  Ok ".wslconfig installed to $wslCfgDst (memory cap prevents immich_server OOM)."
+}
+
+# Pins WSL + container DNS. This is what keeps zrok alive; see wsl-harden.ps1.
+& (Join-Path $InstallRoot 'setup\wsl-harden.ps1') -Distro $Distro
+Ok 'WSL DNS/network hardening applied.'
+
+# --- 4. Register scheduled tasks -------------------------------------------
+Step 4 'Registering scheduled tasks (keepalive anchor + health watchdog)'
+$hostUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+& (Join-Path $InstallRoot 'setup\register-tasks.ps1') `
+    -RuntimeDir (Join-Path $InstallRoot 'runtime') -HostUser $hostUser
+Ok "Tasks registered for $hostUser, pointing at $InstallRoot\runtime."
+
+# --- 5. WSL TCP BBR Optimization & Docker Stack -----------------------------
+if (-not $SkipDocker) {
+  Step 5 'Configuring WSL TCP BBR & Network buffer limits'
+  wsl.exe -d $Distro -u root -- bash -c "modprobe tcp_bbr; echo 'tcp_bbr' >> /etc/modules; echo 'net.core.default_qdisc = fq' >> /etc/sysctl.d/99-sysctl.conf; echo 'net.ipv4.tcp_congestion_control = bbr' >> /etc/sysctl.d/99-sysctl.conf; echo 'net.core.rmem_max = 16777216' >> /etc/sysctl.d/99-sysctl.conf; echo 'net.core.wmem_max = 16777216' >> /etc/sysctl.d/99-sysctl.conf; echo 'net.ipv4.tcp_rmem = 4096 87380 16777216' >> /etc/sysctl.d/99-sysctl.conf; echo 'net.ipv4.tcp_wmem = 4096 65536 16777216' >> /etc/sysctl.d/99-sysctl.conf; sysctl -p /etc/sysctl.d/99-sysctl.conf" 2>&1 | Out-Null
+  Ok 'WSL BBR enabled.'
+
+  Step 5.1 'Bringing up the Immich/zrok Docker stack'
+  $immichWsl = (wsl.exe -d $Distro -u root -- wslpath -a "$((Join-Path $repo 'immich') -replace '\\', '/')" 2>$null).Trim()
+  if (-not $immichWsl) { $immichWsl = '/mnt/d/home-server/immich' }  # fallback to known host path
+  $oldEAP = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  wsl.exe -d $Distro -u root -- bash -c "cd '$immichWsl' && docker compose up -d" 2>&1 | Write-Host
+  $ErrorActionPreference = $oldEAP
+  Ok 'docker compose up -d issued.'
+} else { Warn 'Skipping Docker stack (-SkipDocker).' }
+
+# --- 6. Hotspot + TCP tuning ------------------------------------------------
+if (-not $SkipHotspot) {
+  Step 6 'Starting hotspot + applying TCP tuning'
+  & (Join-Path $InstallRoot 'runtime\hotspot-start.ps1')
+  & (Join-Path $InstallRoot 'setup\tcp-tune.ps1')
+  Ok 'Hotspot start + TCP tuning invoked.'
+} else { Warn 'Skipping hotspot (-SkipHotspot).' }
+
+# --- 7. Health summary ------------------------------------------------------
+Step 7 'Health summary'
+Get-ScheduledTask | Where-Object { $_.TaskName -match 'WSL|Hotspot|Docker' } |
+  Select-Object TaskName, State | Format-Table -AutoSize | Out-String | Write-Host
+$d = (wsl.exe -d $Distro -u root -- bash -c 'systemctl is-active docker 2>/dev/null || echo down' 2>&1 | Out-String).Trim()
+Write-Host ("    Docker in WSL : {0}" -f $d)
+Write-Host ("    netsh TCP     : {0}" -f ((netsh int tcp show global | Select-String 'Auto-Tuning|ECN') -join '; '))
+Write-Host "`nDone. See logs in $InstallRoot\logs and C:\*.log" -ForegroundColor Green

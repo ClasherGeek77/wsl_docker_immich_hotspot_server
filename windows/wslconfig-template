@@ -1,0 +1,9 @@
+# .wslconfig - copied to %USERPROFILE%\.wslconfig by install.ps1
+#
+# Host has 7.8 GB RAM. WSL's default cap is 50% (~3.7 GB), which ran out under load
+# and got immich_server OOMKilled (2026-06-22). 4.5 GB + swap leaves ~3 GB for
+# Windows. Adjust `memory` if the host RAM differs.
+[wsl2]
+memory=4500MB
+swap=4GB
+swapFile=C:\\wsl-swap.vhdx
